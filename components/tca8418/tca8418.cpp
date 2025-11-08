@@ -10,15 +10,15 @@ namespace tca8418 {
 static const char *const TAG = "tca8418";
 
 // TCA8418 registers (from TI datasheet)
-static const uint8_t REG_CFG       = 0x01;
-static const uint8_t REG_INT_STAT  = 0x02;
-static const uint8_t REG_KEY_LCK_EC = 0x03;
+static const uint8_t REG_CFG         = 0x01;
+static const uint8_t REG_INT_STAT    = 0x02;
+static const uint8_t REG_KEY_LCK_EC  = 0x03;
 static const uint8_t REG_KEY_EVENT_A = 0x04;
-static const uint8_t REG_KP_GPIO1  = 0x1D;
-static const uint8_t REG_KP_GPIO2  = 0x1E;
-static const uint8_t REG_KP_GPIO3  = 0x1F;
+static const uint8_t REG_KP_GPIO1    = 0x1D;
+static const uint8_t REG_KP_GPIO2    = 0x1E;
+static const uint8_t REG_KP_GPIO3    = 0x1F;
 
-void TCA8418Component::register_key_sensor(uint8_t index, TCA8418BinarySensor *sensor) {
+void TCA8418Component::register_key_sensor(uint8_t index, binary_sensor::BinarySensor *sensor) {
   if (index >= MAX_KEYS) {
     ESP_LOGW(TAG, "Key index %u out of range (max %u)", index, MAX_KEYS - 1);
     return;
@@ -44,27 +44,24 @@ void TCA8418Component::setup() {
   // KP_GPIO1: rows R0..R7
   // KP_GPIO2: columns C0..C7
   // KP_GPIO3: columns C8..C9
-  uint8_t row_mask = 0;
-  if (rows_ > 0) {
-    if (rows_ > 8)
-      rows_ = 8;
-    row_mask = static_cast<uint8_t>((1u << rows_) - 1u);
-  }
+
+  // For OMOTE we assume rows=6 (R0..R5), cols=4 (C0..C3) hard-coded.
+  // You can make rows_/cols_ configurable later if desired.
+  if (rows_ > 8)
+    rows_ = 8;
+  if (cols_ > 10)
+    cols_ = 10;
+
+  uint8_t row_mask = (rows_ > 0) ? static_cast<uint8_t>((1u << rows_) - 1u) : 0;
 
   uint8_t col_mask_low = 0;
   uint8_t col_mask_high = 0;
   if (cols_ > 0) {
-    uint8_t cols = cols_;
-    if (cols > 10)
-      cols = 10;
-
-    if (cols <= 8) {
-      col_mask_low = static_cast<uint8_t>((1u << cols) - 1u);
+    if (cols_ <= 8) {
+      col_mask_low = static_cast<uint8_t>((1u << cols_) - 1u);
     } else {
-      // C0..C7 in KP_GPIO2
-      col_mask_low = 0xFF;
-      // C8..C9 in KP_GPIO3 bits 0..(cols-9)
-      uint8_t extra = cols - 8;  // 1 or 2
+      col_mask_low = 0xFF;  // C0..C7
+      uint8_t extra = cols_ - 8;  // 1 or 2
       col_mask_high = static_cast<uint8_t>((1u << extra) - 1u);
     }
   }
@@ -149,10 +146,10 @@ void TCA8418Component::process_key_event_(uint8_t ev) {
     return;
   }
 
-  // Datasheet / Adafruit convention:
+  // Datasheet convention:
   // key_code ranges 1..80
   // zero-based: 0..79
-  // row = value // 10, col = value % 10
+  // row = value / 10, col = value % 10
   uint8_t zero_based = key_code - 1;
   uint8_t row = zero_based / 10;
   uint8_t col = zero_based % 10;
@@ -165,12 +162,12 @@ void TCA8418Component::process_key_event_(uint8_t ev) {
     return;
   }
 
-  uint8_t index = row * cols_ + col;
+  uint8_t index = static_cast<uint8_t>(row * cols_ + col);
   if (index >= MAX_KEYS) {
     return;
   }
 
-  TCA8418BinarySensor *sensor = key_sensors_[index];
+  auto *sensor = key_sensors_[index];
   if (sensor != nullptr) {
     sensor->publish_state(pressed);
   }
@@ -184,8 +181,7 @@ void TCA8418Component::loop() {
     return;
   this->last_poll_ = now;
 
-  // If we have an interrupt pin, you *could* check it here and only read
-  // when it's low. For simplicity we always poll the FIFO.
+  // For simplicity we always poll the FIFO; you could also gate on interrupt pin.
   uint8_t ev;
   uint8_t safety = 16;  // don't sit here forever if something is wrong
   while (safety-- > 0 && this->read_key_event_(ev)) {
