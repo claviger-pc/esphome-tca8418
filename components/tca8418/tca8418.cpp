@@ -12,7 +12,6 @@ static const char *const TAG = "tca8418";
 // TCA8418 registers (from TI datasheet)
 static const uint8_t REG_CFG         = 0x01;
 static const uint8_t REG_INT_STAT    = 0x02;
-static const uint8_t REG_KEY_LCK_EC  = 0x03;
 static const uint8_t REG_KEY_EVENT_A = 0x04;
 static const uint8_t REG_KP_GPIO1    = 0x1D;
 static const uint8_t REG_KP_GPIO2    = 0x1E;
@@ -29,17 +28,17 @@ void TCA8418Component::register_key_sensor(uint8_t index, binary_sensor::BinaryS
 void TCA8418Component::setup() {
   ESP_LOGCONFIG(TAG, "Setting up TCA8418 keypad driver...");
 
-  // Basic probe: read CFG register
+  // Probe CFG register (optional, for logging only)
   uint8_t cfg = 0;
   auto err = this->read_byte(REG_CFG, &cfg);
   if (err != i2c::ERROR_OK) {
-    ESP_LOGE(TAG, "I2C error %d reading CFG (reg 0x%02X)", err, REG_CFG);
+    ESP_LOGW(TAG, "I2C error %d reading CFG (0x%02X); continuing anyway", err, REG_CFG);
     this->status_set_warning();
   } else {
     ESP_LOGD(TAG, "TCA8418 CFG initial value: 0x%02X", cfg);
   }
 
-  // For OMOTE we assume rows=6 (R0..R5), cols=4 (C0..C3) hard-coded.
+  // For OMOTE: rows=6 (R0..R5), cols=4 (C0..C3) hard-coded.
   if (rows_ > 8)
     rows_ = 8;
   if (cols_ > 10)
@@ -62,7 +61,7 @@ void TCA8418Component::setup() {
   ESP_LOGD(TAG, "Config rows=%u (mask=0x%02X) cols=%u (mask_low=0x%02X, mask_high=0x%02X)",
            rows_, row_mask, cols_, col_mask_low, col_mask_high);
 
-  // Write keypad configuration, logging any I2C errors
+  // Configure keypad matrix pins.
   err = this->write_byte(REG_KP_GPIO1, row_mask);
   if (err != i2c::ERROR_OK) {
     ESP_LOGE(TAG, "I2C error %d writing KP_GPIO1 (0x%02X)", err, REG_KP_GPIO1);
@@ -81,19 +80,17 @@ void TCA8418Component::setup() {
     this->status_set_warning();
   }
 
-  // Enable key event interrupt & typical settings.
-  // Bit0 KE_IEN=1, Bit4 INT_CFG=1  => 0x11
+  // Enable keypad engine: KE_IEN=1, INT_CFG=1 -> 0x11
   err = this->write_byte(REG_CFG, 0x11);
   if (err != i2c::ERROR_OK) {
     ESP_LOGE(TAG, "I2C error %d writing CFG (0x%02X)", err, REG_CFG);
     this->status_set_warning();
   }
 
-  // Clear any pending interrupts
+  // Clear any pending interrupts, best-effort
   err = this->write_byte(REG_INT_STAT, 0xFF);
   if (err != i2c::ERROR_OK) {
-    ESP_LOGE(TAG, "I2C error %d writing INT_STAT (0x%02X)", err, REG_INT_STAT);
-    this->status_set_warning();
+    ESP_LOGW(TAG, "I2C error %d writing INT_STAT (0x%02X)", err, REG_INT_STAT);
   }
 
   // Optional: configure interrupt pin as input with pull-up
@@ -125,33 +122,24 @@ void TCA8418Component::dump_config() {
 }
 
 bool TCA8418Component::read_key_event_(uint8_t &key_event) {
-  // Check how many events are in the FIFO
-  uint8_t count = 0;
-  auto err = this->read_byte(REG_KEY_LCK_EC, &count);
-  if (err != i2c::ERROR_OK) {
-    ESP_LOGW(TAG, "I2C error %d reading KEY_LCK_EC (0x%02X)", err, REG_KEY_LCK_EC);
-    this->status_set_warning();
-    return false;
-  }
-
-  if (count == 0) {
-    return false;  // no events
-  }
-
-  err = this->read_byte(REG_KEY_EVENT_A, &key_event);
+  // Just read KEY_EVENT_A directly; 0x00 means "no event".
+  auto err = this->read_byte(REG_KEY_EVENT_A, &key_event);
   if (err != i2c::ERROR_OK) {
     ESP_LOGW(TAG, "I2C error %d reading KEY_EVENT_A (0x%02X)", err, REG_KEY_EVENT_A);
     this->status_set_warning();
     return false;
   }
 
-  // Clear interrupt status bits by reading & writing back
+  if (key_event == 0x00) {
+    return false;  // no event
+  }
+
+  ESP_LOGV(TAG, "Got raw KEY_EVENT_A=0x%02X", key_event);
+
+  // Clear interrupt flags best-effort; don't care about errors here
   uint8_t int_stat = 0;
-  err = this->read_byte(REG_INT_STAT, &int_stat);
-  if (err == i2c::ERROR_OK) {
+  if (this->read_byte(REG_INT_STAT, &int_stat) == i2c::ERROR_OK) {
     this->write_byte(REG_INT_STAT, int_stat);
-  } else {
-    ESP_LOGW(TAG, "I2C error %d reading INT_STAT (0x%02X)", err, REG_INT_STAT);
   }
 
   this->status_clear_warning();
@@ -204,7 +192,7 @@ void TCA8418Component::loop() {
   this->last_poll_ = now;
 
   uint8_t ev;
-  uint8_t safety = 16;  // don't sit here forever if something is wrong
+  uint8_t safety = 16;  // avoid infinite loops if FIFO misbehaves
   while (safety-- > 0 && this->read_key_event_(ev)) {
     this->process_key_event_(ev);
   }
