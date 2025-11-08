@@ -33,20 +33,13 @@ void TCA8418Component::setup() {
   uint8_t cfg = 0;
   auto err = this->read_byte(REG_CFG, &cfg);
   if (err != i2c::ERROR_OK) {
-    ESP_LOGE(TAG, "Failed to communicate with TCA8418 (read CFG), I2C error=%d", err);
-    this->mark_failed();
-    return;
+    ESP_LOGE(TAG, "I2C error %d reading CFG (reg 0x%02X)", err, REG_CFG);
+    this->status_set_warning();
+  } else {
+    ESP_LOGD(TAG, "TCA8418 CFG initial value: 0x%02X", cfg);
   }
 
-  ESP_LOGD(TAG, "TCA8418 CFG initial value: 0x%02X", cfg);
-
-  // Configure keypad matrix pins.
-  // KP_GPIO1: rows R0..R7
-  // KP_GPIO2: columns C0..C7
-  // KP_GPIO3: columns C8..C9
-
   // For OMOTE we assume rows=6 (R0..R5), cols=4 (C0..C3) hard-coded.
-  // You can make rows_/cols_ configurable later if desired.
   if (rows_ > 8)
     rows_ = 8;
   if (cols_ > 10)
@@ -69,17 +62,39 @@ void TCA8418Component::setup() {
   ESP_LOGD(TAG, "Config rows=%u (mask=0x%02X) cols=%u (mask_low=0x%02X, mask_high=0x%02X)",
            rows_, row_mask, cols_, col_mask_low, col_mask_high);
 
-  // Write keypad configuration
-  this->write_byte(REG_KP_GPIO1, row_mask);
-  this->write_byte(REG_KP_GPIO2, col_mask_low);
-  this->write_byte(REG_KP_GPIO3, col_mask_high);
+  // Write keypad configuration, logging any I2C errors
+  err = this->write_byte(REG_KP_GPIO1, row_mask);
+  if (err != i2c::ERROR_OK) {
+    ESP_LOGE(TAG, "I2C error %d writing KP_GPIO1 (0x%02X)", err, REG_KP_GPIO1);
+    this->status_set_warning();
+  }
+
+  err = this->write_byte(REG_KP_GPIO2, col_mask_low);
+  if (err != i2c::ERROR_OK) {
+    ESP_LOGE(TAG, "I2C error %d writing KP_GPIO2 (0x%02X)", err, REG_KP_GPIO2);
+    this->status_set_warning();
+  }
+
+  err = this->write_byte(REG_KP_GPIO3, col_mask_high);
+  if (err != i2c::ERROR_OK) {
+    ESP_LOGE(TAG, "I2C error %d writing KP_GPIO3 (0x%02X)", err, REG_KP_GPIO3);
+    this->status_set_warning();
+  }
 
   // Enable key event interrupt & typical settings.
-  // Bit0 KE_IEN=1, Bit4 INT_CFG=1  => 0x11 is a common "example" config.
-  this->write_byte(REG_CFG, 0x11);
+  // Bit0 KE_IEN=1, Bit4 INT_CFG=1  => 0x11
+  err = this->write_byte(REG_CFG, 0x11);
+  if (err != i2c::ERROR_OK) {
+    ESP_LOGE(TAG, "I2C error %d writing CFG (0x%02X)", err, REG_CFG);
+    this->status_set_warning();
+  }
 
   // Clear any pending interrupts
-  this->write_byte(REG_INT_STAT, 0xFF);
+  err = this->write_byte(REG_INT_STAT, 0xFF);
+  if (err != i2c::ERROR_OK) {
+    ESP_LOGE(TAG, "I2C error %d writing INT_STAT (0x%02X)", err, REG_INT_STAT);
+    this->status_set_warning();
+  }
 
   // Optional: configure interrupt pin as input with pull-up
   if (this->interrupt_pin_ != nullptr) {
@@ -87,7 +102,7 @@ void TCA8418Component::setup() {
     this->interrupt_pin_->pin_mode(gpio::FLAG_INPUT | gpio::FLAG_PULLUP);
   }
 
-  ESP_LOGCONFIG(TAG, "TCA8418 setup done");
+  ESP_LOGCONFIG(TAG, "TCA8418 setup complete (warning=%d)", this->status_has_warning());
 }
 
 void TCA8418Component::dump_config() {
@@ -102,6 +117,10 @@ void TCA8418Component::dump_config() {
   }
   if (this->is_failed()) {
     ESP_LOGE(TAG, "  Status: FAILED");
+  } else if (this->status_has_warning()) {
+    ESP_LOGW(TAG, "  Status: WARNING (I2C errors seen)");
+  } else {
+    ESP_LOGCONFIG(TAG, "  Status: OK");
   }
 }
 
@@ -110,7 +129,7 @@ bool TCA8418Component::read_key_event_(uint8_t &key_event) {
   uint8_t count = 0;
   auto err = this->read_byte(REG_KEY_LCK_EC, &count);
   if (err != i2c::ERROR_OK) {
-    ESP_LOGW(TAG, "I2C error reading KEY_LCK_EC: %d", err);
+    ESP_LOGW(TAG, "I2C error %d reading KEY_LCK_EC (0x%02X)", err, REG_KEY_LCK_EC);
     this->status_set_warning();
     return false;
   }
@@ -121,15 +140,18 @@ bool TCA8418Component::read_key_event_(uint8_t &key_event) {
 
   err = this->read_byte(REG_KEY_EVENT_A, &key_event);
   if (err != i2c::ERROR_OK) {
-    ESP_LOGW(TAG, "I2C error reading KEY_EVENT_A: %d", err);
+    ESP_LOGW(TAG, "I2C error %d reading KEY_EVENT_A (0x%02X)", err, REG_KEY_EVENT_A);
     this->status_set_warning();
     return false;
   }
 
   // Clear interrupt status bits by reading & writing back
   uint8_t int_stat = 0;
-  if (this->read_byte(REG_INT_STAT, &int_stat) == i2c::ERROR_OK) {
+  err = this->read_byte(REG_INT_STAT, &int_stat);
+  if (err == i2c::ERROR_OK) {
     this->write_byte(REG_INT_STAT, int_stat);
+  } else {
+    ESP_LOGW(TAG, "I2C error %d reading INT_STAT (0x%02X)", err, REG_INT_STAT);
   }
 
   this->status_clear_warning();
@@ -181,7 +203,6 @@ void TCA8418Component::loop() {
     return;
   this->last_poll_ = now;
 
-  // For simplicity we always poll the FIFO; you could also gate on interrupt pin.
   uint8_t ev;
   uint8_t safety = 16;  // don't sit here forever if something is wrong
   while (safety-- > 0 && this->read_key_event_(ev)) {
